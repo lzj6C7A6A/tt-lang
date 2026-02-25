@@ -213,7 +213,24 @@ def _run_perf_dump(tensors: tuple, kernel_name: str):
     ttl-dump-cb-flow-graph pass), and pipe graph from
     /tmp/ttlang_pipe_graph.json (copied from compiler temp file).
     """
-    from ._src.noc_summary import run as noc_summary_run
+    from ._src.perf_summary import run as perf_summary_run
+
+    # Flush profiler data from device (requires mid-run dump)
+    if os.environ.get("TT_METAL_PROFILER_MID_RUN_DUMP") != "1":
+        print(
+            "[perf_dump] WARNING: TT_METAL_PROFILER_MID_RUN_DUMP=1 not set, "
+            "profiler data may be stale"
+        )
+    device = None
+    for tensor in tensors:
+        if is_ttnn_tensor(tensor) and hasattr(tensor, "device"):
+            device = tensor.device()
+            break
+    if device is not None:
+        try:
+            ttnn.ReadDeviceProfiler(device)
+        except Exception as e:
+            print(f"[perf_dump] WARNING: Failed to read device profiler: {e}")
 
     tt_metal_home = os.environ.get("TT_METAL_HOME", "")
     if not tt_metal_home:
@@ -226,7 +243,7 @@ def _run_perf_dump(tensors: tuple, kernel_name: str):
             f"Profiler logs directory not found: {logs_path}\n"
             "Ensure TT_METAL_DEVICE_PROFILER_NOC_EVENTS=1 is set"
         )
-    result = noc_summary_run(logs_path, names=[kernel_name])
+    result = perf_summary_run(logs_path, names=[kernel_name])
     if result:
         print(result)
 
@@ -240,9 +257,10 @@ def _run_perf_dump(tensors: tuple, kernel_name: str):
     # Pipe graph (copied from compiler temp file)
     pipe_graph_path = Path("/tmp/ttlang_pipe_graph.json")
     if not pipe_graph_path.exists():
-        raise ValueError(f"Pipe graph not found: {pipe_graph_path}")
-    print("=== PIPE GRAPH ===")
-    print(pipe_graph_path.read_text())
+        print(f"[perf_dump] WARNING: Pipe graph not found: {pipe_graph_path}")
+    else:
+        print("=== PIPE GRAPH ===")
+        print(pipe_graph_path.read_text())
 
 
 def _detect_memory_space_from_tensor(tensor, default: str) -> str:
@@ -1140,16 +1158,6 @@ def _compile_kernel(
                 source_file = all_source_files.get(first_thread)
             formatted = format_mlir_error(error_msg, source_lines, source_file)
             raise RuntimeError(formatted) from None
-
-        # Copy pipe graph to stable path for perf tooling
-        if perf_dump and pipe_graph_path:
-            import shutil
-
-            stable_pipe_path = "/tmp/ttlang_pipe_graph.json"
-            try:
-                shutil.copy2(pipe_graph_path, stable_pipe_path)
-            except OSError:
-                pass
 
         final_mlir_path = os.environ.get("TTLANG_FINAL_MLIR")
         if final_mlir_path:
