@@ -590,19 +590,25 @@ mlir::LogicalResult mlir::tt::ttl::ComputeOp::verify() {
     }
   }
 
-  // Validate any ttl.tile_store ops in the body. tile_store is the hardware
-  // write (becomes pack_tile) and is independent of the yield terminator.
+  // The body must contain at least one tile_store. tile_store is the hardware
+  // write (becomes pack_tile) and is the only mechanism for the compute to
+  // produce observable output via pack to the output circular buffer.
+  bool hasTileStore = false;
   for (Operation &op : bodyBlock.without_terminator()) {
     auto store = dyn_cast<TileStoreOp>(&op);
     if (!store) {
       continue;
     }
+    hasTileStore = true;
     if (!store.getView().getDefiningOp<CBReserveOp>()) {
       return store.emitOpError() << "view must be produced by ttl.cb_reserve";
     }
   }
+  if (!hasTileStore) {
+    return emitOpError("body must contain at least one ttl.tile_store");
+  }
 
-  return mlir::success();
+  return success();
 }
 
 mlir::LogicalResult mlir::tt::ttl::CBReserveOp::verify() {
@@ -656,6 +662,10 @@ mlir::LogicalResult mlir::tt::ttl::StoreOp::verify() {
                            << ") must match view shape dimension ("
                            << viewTy.getDimSize(i) << ")";
     }
+  }
+
+  if (!getView().getDefiningOp<CBReserveOp>()) {
+    return emitOpError() << "view must come from ttl.cb_reserve";
   }
 
   return success();
