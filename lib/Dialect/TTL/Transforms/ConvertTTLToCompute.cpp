@@ -29,11 +29,11 @@ static Value buildInitTensor(OpBuilder &b, Location loc, RankedTensorType type,
   SmallVector<Value> dynDims;
   for (auto dim : llvm::enumerate(type.getShape())) {
     if (dim.value() == ShapedType::kDynamic) {
-      dynDims.push_back(b.create<tensor::DimOp>(loc, exemplar, dim.index()));
+      dynDims.push_back(tensor::DimOp::create(b, loc, exemplar, dim.index()));
     }
   }
-  return b.create<tensor::EmptyOp>(loc, type.getShape(), type.getElementType(),
-                                   dynDims);
+  return tensor::EmptyOp::create(b, loc, type.getShape(), type.getElementType(),
+                                 dynDims);
 }
 
 /// Find the output CB for an elementwise op by looking at its store users.
@@ -93,7 +93,7 @@ static void emitTileStores(PatternRewriter &rewriter, Location loc,
     if (!storeOp) {
       continue;
     }
-    rewriter.create<TileStoreOp>(loc, tileResult, storeOp.getView());
+    TileStoreOp::create(rewriter, loc, tileResult, storeOp.getView());
     storesToErase.push_back(storeOp);
   }
   for (StoreOp s : storesToErase) {
@@ -111,10 +111,10 @@ static Value emitTileOpFor(OpBuilder &b, Location loc, Operation *elementwiseOp,
                            ValueRange tileOperands, Type tileType) {
 #define TTL_UNARY_TILE_OP(TTL_OP, TILE_OP, TTK_INIT, TTK_COMPUTE)              \
   if (isa<TTL_OP##Op>(elementwiseOp))                                          \
-    return b.create<TILE_OP>(loc, tileType, tileOperands[0]);
+    return TILE_OP::create(b, loc, tileType, tileOperands[0]);
 #define TTL_BINARY_TILE_OP(TTL_OP, TILE_OP, TTK_INIT, TTK_COMPUTE)             \
   if (isa<TTL_OP##Op>(elementwiseOp))                                          \
-    return b.create<TILE_OP>(loc, tileType, tileOperands[0], tileOperands[1]);
+    return TILE_OP::create(b, loc, tileType, tileOperands[0], tileOperands[1]);
 #define TTL_BINARY_TILE_OP_MINMAX(TTL_OP, TILE_OP, TTK_INIT, TTK_COMPUTE)      \
   TTL_BINARY_TILE_OP(TTL_OP, TILE_OP, TTK_INIT, TTK_COMPUTE)
 #include "ttlang/Dialect/TTL/TTLElementwiseOps.def"
@@ -274,11 +274,11 @@ static LogicalResult buildFusedCompute(Operation *sinkOp,
   // Create init tensor and attach to output CB
   Value init = buildInitTensor(rewriter, loc, type, trace.rootInputs[0]);
   Value initAttached =
-      rewriter.create<AttachCBOp>(loc, init.getType(), init, outCb);
+      AttachCBOp::create(rewriter, loc, init.getType(), init, outCb);
 
   // Create ttl.compute op
-  auto computeOp = rewriter.create<ComputeOp>(
-      loc, TypeRange{type}, trace.rootInputs.getArrayRef(),
+  auto computeOp = ComputeOp::create(
+      rewriter, loc, TypeRange{type}, trace.rootInputs.getArrayRef(),
       ValueRange{initAttached}, rewriter.getArrayAttr(maps),
       rewriter.getArrayAttr(iterTypes));
 
@@ -337,8 +337,8 @@ static LogicalResult buildFusedCompute(Operation *sinkOp,
   // Helper: clone a signpost or dprint op into the compute body.
   auto emitSideEffectOp = [&](Operation *op) {
     if (auto sp = dyn_cast<SignpostOp>(op)) {
-      rewriter.create<SignpostOp>(sp.getLoc(), sp.getNameAttr(),
-                                  sp.getIsEndAttr());
+      SignpostOp::create(rewriter, sp.getLoc(), sp.getNameAttr(),
+                         sp.getIsEndAttr());
     } else {
       rewriter.clone(*op);
     }
@@ -365,8 +365,8 @@ static LogicalResult buildFusedCompute(Operation *sinkOp,
     if (auto bcastOp = dyn_cast<BcastOp>(op)) {
       Value inputTile = tensorToTile[bcastOp.getInput()];
       Value outputTile = body->getArguments().back(); // output block arg
-      tileResult = rewriter.create<TileBcastOp>(
-          loc, tileType, inputTile, outputTile, bcastOp.getBcastTypeAttr());
+      tileResult = TileBcastOp::create(rewriter, loc, tileType, inputTile,
+                                       outputTile, bcastOp.getBcastTypeAttr());
     } else {
       // Elementwise ops
       SmallVector<Value, 2> tileOperands;
@@ -406,7 +406,7 @@ static LogicalResult buildFusedCompute(Operation *sinkOp,
     emitSideEffectOp(*it);
   }
 
-  rewriter.create<YieldOp>(loc);
+  YieldOp::create(rewriter, loc);
   rewriter.replaceOp(sinkOp, computeOp.getResult(0));
 
   // Erase the fused ops in reverse topological order (sink to roots).
@@ -484,13 +484,14 @@ static LogicalResult buildBinaryCompute(Operation *op,
   // Create init tensor and attach to output CB.
   Value init = buildInitTensor(rewriter, loc, type, lhs);
   Value initAttached =
-      rewriter.create<AttachCBOp>(loc, init.getType(), init, outCb);
+      AttachCBOp::create(rewriter, loc, init.getType(), init, outCb);
 
   // Inputs are already attached, use them directly.
   // Create ttl.compute op
-  auto computeOp = rewriter.create<ComputeOp>(
-      loc, TypeRange{type}, ValueRange{lhs, rhs}, ValueRange{initAttached},
-      rewriter.getArrayAttr(maps), rewriter.getArrayAttr(iterTypes));
+  auto computeOp =
+      ComputeOp::create(rewriter, loc, TypeRange{type}, ValueRange{lhs, rhs},
+                        ValueRange{initAttached}, rewriter.getArrayAttr(maps),
+                        rewriter.getArrayAttr(iterTypes));
 
   // Build the body region with tile type block arguments
   Block *body = rewriter.createBlock(&computeOp.getBody());
@@ -502,10 +503,10 @@ static LogicalResult buildBinaryCompute(Operation *op,
   body->addArgument(tileType, loc); // output tile
 
   rewriter.setInsertionPointToStart(body);
-  Value result = rewriter.create<TileOp>(loc, tileType, body->getArgument(0),
-                                         body->getArgument(1));
+  Value result = TileOp::create(rewriter, loc, tileType, body->getArgument(0),
+                                body->getArgument(1));
   emitTileStores(rewriter, loc, result, op);
-  rewriter.create<YieldOp>(loc);
+  YieldOp::create(rewriter, loc);
   rewriter.replaceOp(op, computeOp.getResult(0));
   return success();
 }
@@ -561,13 +562,14 @@ static LogicalResult buildUnaryCompute(Operation *op, PatternRewriter &rewriter,
   // Create init tensor and attach to output CB.
   Value init = buildInitTensor(rewriter, loc, type, input);
   Value initAttached =
-      rewriter.create<AttachCBOp>(loc, init.getType(), init, outCb);
+      AttachCBOp::create(rewriter, loc, init.getType(), init, outCb);
 
   // Input is already attached, use it directly.
   // Create ttl.compute op
-  auto computeOp = rewriter.create<ComputeOp>(
-      loc, TypeRange{type}, ValueRange{input}, ValueRange{initAttached},
-      rewriter.getArrayAttr(maps), rewriter.getArrayAttr(iterTypes));
+  auto computeOp =
+      ComputeOp::create(rewriter, loc, TypeRange{type}, ValueRange{input},
+                        ValueRange{initAttached}, rewriter.getArrayAttr(maps),
+                        rewriter.getArrayAttr(iterTypes));
 
   // Build the body region with tile type block arguments
   Block *body = rewriter.createBlock(&computeOp.getBody());
@@ -578,9 +580,9 @@ static LogicalResult buildUnaryCompute(Operation *op, PatternRewriter &rewriter,
   body->addArgument(tileType, loc); // output tile
 
   rewriter.setInsertionPointToStart(body);
-  Value result = rewriter.create<TileOp>(loc, tileType, body->getArgument(0));
+  Value result = TileOp::create(rewriter, loc, tileType, body->getArgument(0));
   emitTileStores(rewriter, loc, result, op);
-  rewriter.create<YieldOp>(loc);
+  YieldOp::create(rewriter, loc);
   rewriter.replaceOp(op, computeOp.getResult(0));
   return success();
 }
@@ -728,12 +730,12 @@ struct LowerBcastToCompute : OpRewritePattern<BcastOp> {
 
     Value init = buildInitTensor(rewriter, loc, outputType, op.getOutput());
     Value initAttached =
-        rewriter.create<AttachCBOp>(loc, init.getType(), init, outCb);
+        AttachCBOp::create(rewriter, loc, init.getType(), init, outCb);
 
-    auto computeOp = rewriter.create<ComputeOp>(
-        loc, TypeRange{outputType}, ValueRange{op.getInput(), op.getOutput()},
-        ValueRange{initAttached}, rewriter.getArrayAttr(maps),
-        rewriter.getArrayAttr(iterTypes));
+    auto computeOp = ComputeOp::create(
+        rewriter, loc, TypeRange{outputType},
+        ValueRange{op.getInput(), op.getOutput()}, ValueRange{initAttached},
+        rewriter.getArrayAttr(maps), rewriter.getArrayAttr(iterTypes));
 
     Block *body = rewriter.createBlock(&computeOp.getBody());
     Type scalarType = outputType.getElementType();
@@ -744,10 +746,10 @@ struct LowerBcastToCompute : OpRewritePattern<BcastOp> {
 
     rewriter.setInsertionPointToStart(body);
     Value result =
-        rewriter.create<TileBcastOp>(loc, tileType, body->getArgument(0),
-                                     body->getArgument(1), op.getBcastType());
+        TileBcastOp::create(rewriter, loc, tileType, body->getArgument(0),
+                            body->getArgument(1), op.getBcastType());
     emitTileStores(rewriter, loc, result, op.getOperation());
-    rewriter.create<YieldOp>(loc);
+    YieldOp::create(rewriter, loc);
     rewriter.replaceOp(op, computeOp.getResult(0));
     return success();
   }
@@ -797,11 +799,12 @@ struct LowerStoreToCompute : OpRewritePattern<StoreOp> {
 
     Value init = buildInitTensor(rewriter, loc, inputType, input);
     Value initAttached =
-        rewriter.create<AttachCBOp>(loc, init.getType(), init, outputCb);
+        AttachCBOp::create(rewriter, loc, init.getType(), init, outputCb);
 
-    auto computeOp = rewriter.create<ComputeOp>(
-        loc, TypeRange{inputType}, ValueRange{input}, ValueRange{initAttached},
-        rewriter.getArrayAttr(maps), rewriter.getArrayAttr(iterTypes));
+    auto computeOp = ComputeOp::create(
+        rewriter, loc, TypeRange{inputType}, ValueRange{input},
+        ValueRange{initAttached}, rewriter.getArrayAttr(maps),
+        rewriter.getArrayAttr(iterTypes));
 
     Block *body = rewriter.createBlock(&computeOp.getBody());
     Type scalarType = inputType.getElementType();
@@ -810,8 +813,8 @@ struct LowerStoreToCompute : OpRewritePattern<StoreOp> {
     body->addArgument(tileType, loc);
 
     rewriter.setInsertionPointToEnd(body);
-    rewriter.create<TileStoreOp>(loc, body->getArgument(0), reserveView);
-    rewriter.create<YieldOp>(loc);
+    TileStoreOp::create(rewriter, loc, body->getArgument(0), reserveView);
+    YieldOp::create(rewriter, loc);
 
     // make_early_inc_range: replaceOp erases attachOp, invalidating the
     // use-list iterator.

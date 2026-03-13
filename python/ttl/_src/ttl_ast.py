@@ -8,14 +8,14 @@ from dataclasses import dataclass
 from typing import List, Optional, Set
 
 from pykernel._src.kernel_ast import TTCompilerBase
-from ttmlir.dialects import arith, func, ttcore, ttkernel
-from ttmlir.ir import *
+from ttl.dialects import arith, func, ttcore, ttkernel
+from ttl.ir import *
 
 from ..constants import DEFAULT_TILE_SIZE
 from ..diagnostics import TTLangCompileError
-from ..dialects import ttl
+from ttl.dialects import ttl
 from ..dtype_utils import is_ttnn_tensor, tensor_dtype_to_ttcore_datatype
-from ..layouts import TTNNLayoutConfig, create_ttnn_layout
+from ..layouts import LayoutConfig, create_layout
 from ..ttl_utils import get_thread_type_string
 from .auto_profile import (
     get_line_mapper,
@@ -61,9 +61,9 @@ def _ceil_div(a, b):
 
 
 def _build_tensor_type(ctx, tensor, grid, tiled, memory_space):
-    """Build MLIR tensor type for a ttnn tensor with TTNNLayoutAttr."""
+    """Build MLIR tensor type with TTLLayoutAttr encoding."""
     if not tiled:
-        raise ValueError("Only tiled tensors supported for TTNN interop")
+        raise ValueError("Only tiled tensors supported")
     if memory_space not in ("L1", "DRAM"):
         raise ValueError(f"Only L1 or DRAM memory space supported, got {memory_space}")
     if len(grid) != 2:
@@ -81,9 +81,9 @@ def _build_tensor_type(ctx, tensor, grid, tiled, memory_space):
             f"All shape dimensions must be positive, got shape {tensor.shape}",
         )
 
-    layout = create_ttnn_layout(
+    layout = create_layout(
         ctx,
-        TTNNLayoutConfig(
+        LayoutConfig(
             logical_shape=shape,
             grid=grid,
             dtype=tensor.dtype,
@@ -402,7 +402,7 @@ class TTLGenericCompiler(TTCompilerBase):
             return (self._to_index_value(node), False)
 
     # Override to use i64 for all integer constants (attributes or not)
-    # D2M ops require i64, and this reduces casts throughout the pipeline
+    # TTL/TTKernel ops require i64, and this reduces casts throughout the pipeline
     def visit_Constant(self, node):
         as_attr = getattr(node, "_ttkernel_as_attr", False)
         op_constructor = IntegerAttr.get if as_attr else arith.ConstantOp
@@ -645,7 +645,7 @@ class TTLGenericCompiler(TTCompilerBase):
         object-mode dprint."""
         if ttl.CircularBufferType.maybe_downcast(val.type) is not None:
             return True
-        if RankedTensorType.isinstance(val.type):
+        if isinstance(val.type, RankedTensorType):
             return True
         return False
 
@@ -662,7 +662,7 @@ class TTLGenericCompiler(TTCompilerBase):
             )
             return
 
-        if RankedTensorType.isinstance(val.type):
+        if isinstance(val.type, RankedTensorType):
             if is_tensor_accessor:
                 # Tensor accessors use page-based printing (spec: num_pages
                 # defaults to 1). TileSlice is not available for raw tensors.
@@ -715,7 +715,7 @@ class TTLGenericCompiler(TTCompilerBase):
                 fmt += str(const_val) + " "
             else:
                 if not (
-                    IndexType.isinstance(val.type) or IntegerType.isinstance(val.type)
+                    isinstance(val.type, IndexType) or isinstance(val.type, IntegerType)
                 ):
                     raise ValueError(
                         f"print() scalar mode supports integer variables, "
