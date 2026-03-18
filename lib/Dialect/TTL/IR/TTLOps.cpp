@@ -233,21 +233,22 @@ mlir::LogicalResult mlir::tt::ttl::WaitOp::verify() {
   return success();
 }
 
-mlir::LogicalResult mlir::tt::ttl::LinearizedIndexOp::verify() {
-  AffineMap map = getIndexMap();
+mlir::LogicalResult mlir::tt::ttl::IterIndexOp::verify() {
+  int64_t dim = getDim();
 
-  // Verify that the map has at least one dimension
-  if (map.getNumDims() == 0) {
-    return emitOpError() << "index_map must have at least one dimension";
+  // ParentOneOf<["ComputeOp"]> trait guarantees the parent is a ComputeOp.
+  auto computeOp = (*this)->getParentOfType<ComputeOp>();
+  assert(computeOp && "ParentOneOf trait should enforce ComputeOp parent");
+
+  // Verify dim is within the iteration domain rank.
+  unsigned iterRank = computeOp.getIteratorTypesArray().size();
+  if (static_cast<unsigned>(dim) >= iterRank) {
+    return emitOpError() << "dimension " << dim
+                         << " is out of range for iteration domain of rank "
+                         << iterRank;
   }
 
-  // Verify that the map has exactly one result (the linearized index)
-  if (map.getNumResults() != 1) {
-    return emitOpError() << "index_map must have exactly one result, got "
-                         << map.getNumResults();
-  }
-
-  return mlir::success();
+  return success();
 }
 
 mlir::LogicalResult mlir::tt::ttl::CopyTileOp::verify() {
@@ -261,7 +262,7 @@ mlir::LogicalResult mlir::tt::ttl::CopyTileOp::verify() {
            << dstTileTy << ", src: " << srcTy;
   }
 
-  return mlir::success();
+  return success();
 }
 
 void mlir::tt::ttl::ComputeOp::print(mlir::OpAsmPrinter &p) {
@@ -960,6 +961,22 @@ mlir::LogicalResult mlir::tt::ttl::TileStoreOp::verify() {
   if (viewElemTy != tileType) {
     return emitOpError() << "view element type (" << viewElemTy
                          << ") must match tile type (" << tileType << ")";
+  }
+
+  // Inside a compute body, indices must match the view rank (populated by
+  // convert-ttl-to-compute or assign-dst). Outside, allow empty indices.
+  size_t numIndices = getIndices().size();
+  bool insideCompute = (*this)->getParentOfType<ComputeOp>() != nullptr;
+  if (insideCompute) {
+    if (numIndices != static_cast<size_t>(viewTy.getRank())) {
+      return emitOpError() << "expected " << viewTy.getRank()
+                           << " indices inside compute body, got "
+                           << numIndices;
+    }
+  } else if (numIndices != 0 &&
+             numIndices != static_cast<size_t>(viewTy.getRank())) {
+    return emitOpError() << "expected 0 or " << viewTy.getRank()
+                         << " indices, got " << numIndices;
   }
 
   return success();

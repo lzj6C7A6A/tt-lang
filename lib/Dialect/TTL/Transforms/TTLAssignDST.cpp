@@ -165,34 +165,6 @@ struct Interval {
   Value value;   // SSA value this interval represents
 };
 
-/// Compute the AffineMap for linearizing CB tile indices for a block argument.
-/// Returns failure if the argument is not found in inputs.
-static FailureOr<AffineMapAttr> computeIndexMapAttr(BlockArgument arg,
-                                                    ComputeOp computeOp,
-                                                    OpBuilder &builder) {
-  Block *body = &computeOp.getRegion().front();
-  for (auto [idx, input] : llvm::enumerate(computeOp.getInputs())) {
-    if (arg == body->getArgument(idx)) {
-      auto tensorType = cast<RankedTensorType>(input.getType());
-      int64_t rank = tensorType.getRank();
-
-      SmallVector<int64_t> staticShape(tensorType.getShape().begin(),
-                                       tensorType.getShape().end());
-      SmallVector<int64_t> strides = mlir::computeStrides(staticShape);
-
-      AffineExpr linearExpr = builder.getAffineConstantExpr(0);
-      for (int64_t i = 0; i < rank; ++i) {
-        linearExpr = linearExpr + builder.getAffineDimExpr(i) *
-                                      builder.getAffineConstantExpr(strides[i]);
-      }
-
-      AffineMap indexMap = AffineMap::get(rank, /*numSymbols=*/0, linearExpr);
-      return AffineMapAttr::get(indexMap);
-    }
-  }
-  return failure();
-}
-
 /// Allocate a DST register and create a CopyTileOp for a block argument.
 /// Looks up assignment first; falls back to allocating a free register.
 /// If dstIndexOverride is provided, it takes precedence over the assignment
@@ -218,18 +190,13 @@ static FailureOr<CopyTileOp> createCopyTileForArg(
   inUse.set(assignedDstIndex);
 
   Location loc = builder.getInsertionPoint()->getLoc();
-  auto indexMapAttr = computeIndexMapAttr(arg, computeOp, builder);
-  if (failed(indexMapAttr)) {
-    return computeOp.emitOpError("block argument not found in compute inputs");
-  }
-
-  Value srcIndex = LinearizedIndexOp::create(builder, loc, *indexMapAttr);
   Value dstIndex =
       arith::ConstantIndexOp::create(builder, loc, assignedDstIndex);
+  // src_indices are empty here; populated by the iter_index phase below.
   auto copy = CopyTileOp::create(
       builder, loc,
       TypeRange{DSTRegisterType::get(arg.getContext()), arg.getType()},
-      ValueRange{arg, srcIndex, dstIndex});
+      ValueRange{arg, dstIndex});
   dstIndexForValue[copy.getDstTile()] = assignedDstIndex;
   return copy;
 }
@@ -316,18 +283,17 @@ static void insertCopiesForMultiConsumerValues(ComputeOp computeOp,
 
       Value copyResult;
       if (isa<BlockArgument>(value)) {
-        // Block argument: insert copy_tile (CB-to-DST)
-        // Use sentinel kPlaceholderIndex for src_index and dst_index - will be
-        // replaced later with proper LinearizedIndexOp and allocated DST index
-        Value srcIndex =
-            arith::ConstantIndexOp::create(builder, loc, kPlaceholderIndex);
+        // Block argument: insert placeholder copy_tile (CB-to-DST).
+        // Replaced later with proper DST index allocation. Marked with
+        // kPlaceholderCopyAttrName so Phase 2b can identify and replace it.
         Value dstIndex =
             arith::ConstantIndexOp::create(builder, loc, kPlaceholderIndex);
         auto copyOp = CopyTileOp::create(
             builder, loc,
             TypeRange{DSTRegisterType::get(value.getContext()),
                       value.getType()},
-            ValueRange{value, srcIndex, dstIndex});
+            ValueRange{value, dstIndex});
+        copyOp->setAttr(kPlaceholderCopyAttrName, builder.getUnitAttr());
         copyResult = copyOp.getDstTile();
         LLVM_DEBUG({
           llvm::dbgs()
@@ -798,13 +764,8 @@ struct TTLAssignDSTPass : public impl::TTLAssignDSTBase<TTLAssignDSTPass> {
         }
       }
 
-      // Helper to check if a copy_tile has placeholder indices
       auto isPlaceholderCopy = [](CopyTileOp copyTile) {
-        if (auto srcConst = copyTile.getSrcIndex()
-                                .getDefiningOp<arith::ConstantIndexOp>()) {
-          return srcConst.value() == kPlaceholderIndex;
-        }
-        return false;
+        return copyTile->hasAttr(kPlaceholderCopyAttrName);
       };
 
       // First: Replace placeholder copy_tile ops with proper copies
@@ -843,12 +804,8 @@ struct TTLAssignDSTPass : public impl::TTLAssignDSTBase<TTLAssignDSTPass> {
         placeholder.getDstTile().replaceAllUsesWith(newCopy->getDstTile());
         placeholder.getDstToken().replaceAllUsesWith(newCopy->getDstToken());
 
-        Operation *srcIndexDef = placeholder.getSrcIndex().getDefiningOp();
         Operation *dstIndexDef = placeholder.getDstIndex().getDefiningOp();
         placeholder.erase();
-        if (srcIndexDef && srcIndexDef->use_empty()) {
-          srcIndexDef->erase();
-        }
         if (dstIndexDef && dstIndexDef->use_empty()) {
           dstIndexDef->erase();
         }
@@ -915,19 +872,78 @@ struct TTLAssignDSTPass : public impl::TTLAssignDSTBase<TTLAssignDSTPass> {
       }
 
       //=== Post-pass verification: no placeholder copy_tile ops ===
-      // A placeholder copy_tile has kPlaceholderIndex as src_index or
-      // dst_index. These are inserted in Phase 1 for block args with multiple
-      // consumers and should have been replaced with proper copies.
       for (Operation &op : *body) {
         if (auto copyTile = dyn_cast<CopyTileOp>(&op)) {
           if (isPlaceholderCopy(copyTile)) {
             copyTile.emitOpError()
-                << "placeholder copy_tile not replaced with proper copy "
-                << "(src_index has sentinel value " << kPlaceholderIndex << ")";
+                << "placeholder copy_tile not replaced with proper copy";
             signalPassFailure();
             return;
           }
         }
+      }
+
+      //=== Populate CB indices using iter_index ===
+      // Create iter_index ops and apply per-operand indexing maps to produce
+      // src_indices on copy_tile and indices on tile_store.
+      {
+        auto indexingMaps = computeOp.getIndexingMapsArray();
+        SmallVector<Value> iterIndices =
+            getOrCreateIterIndices(builder, computeOp);
+
+        // Populate copy_tile src_indices.
+        SmallVector<CopyTileOp> copyTiles;
+        for (Operation &op : *body) {
+          if (auto ct = dyn_cast<CopyTileOp>(&op)) {
+            if (ct.getSrcIndices().empty()) {
+              copyTiles.push_back(ct);
+            }
+          }
+        }
+        for (CopyTileOp ct : copyTiles) {
+          // copy_tile sources inside a compute body are always block arguments.
+          auto blockArg = dyn_cast<BlockArgument>(ct.getSrc());
+          assert(blockArg &&
+                 "copy_tile src must be a block argument inside compute body");
+
+          unsigned argIdx = blockArg.getArgNumber();
+          // ComputeOp verifier guarantees block args match indexing maps.
+          assert(argIdx < indexingMaps.size() &&
+                 "block arg index out of range for indexing maps");
+          AffineMap inputMap = indexingMaps[argIdx];
+
+          builder.setInsertionPoint(ct);
+          SmallVector<Value> cbIndices = applyIndexingMapToIterIndices(
+              builder, ct.getLoc(), inputMap, iterIndices);
+
+          auto newCopy = CopyTileOp::create(
+              builder, ct.getLoc(),
+              TypeRange{ct.getDstToken().getType(), ct.getDstTile().getType()},
+              ct.getSrc(), ct.getDstIndex(), cbIndices);
+          for (NamedAttribute attr : ct->getAttrs()) {
+            newCopy->setAttr(attr.getName(), attr.getValue());
+          }
+          ct.getDstToken().replaceAllUsesWith(newCopy.getDstToken());
+          ct.getDstTile().replaceAllUsesWith(newCopy.getDstTile());
+          ct.erase();
+        }
+
+        // All copy_tile ops must have populated src_indices at this point.
+        for (Operation &op : *body) {
+          if (auto ct = dyn_cast<CopyTileOp>(&op)) {
+            if (ct.getSrcIndices().empty()) {
+              ct.emitOpError()
+                  << "copy_tile has empty src_indices after iter_index phase";
+              signalPassFailure();
+              return;
+            }
+          }
+        }
+
+        LLVM_DEBUG({
+          llvm::dbgs() << "=== Populated CB indices using iter_index ("
+                       << iterIndices.size() << "D) ===\n";
+        });
       }
 
       //=== Compute and attach unroll_factor ===

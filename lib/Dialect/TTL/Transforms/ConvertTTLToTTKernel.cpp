@@ -6,6 +6,7 @@
 
 #include "ttlang/Dialect/TTKernel/Transforms/TTKernelCleanupPatterns.h"
 
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -349,14 +350,11 @@ struct TileStoreLowering : OpConversionPattern<TileStoreOp> {
           op, "view must come from ttl.cb_reserve (unrealized cast from CB)");
     }
 
-    // CB shape rank is the rank of the view tensor (from cb_reserve).
+    // Linearize multi-dimensional CB indices to a flat tile index.
     auto viewTy = mlir::cast<RankedTensorType>(op.getView().getType());
-    size_t cbShapeRank = viewTy.getRank();
-    auto cbTileIndex =
-        utils::computeCBTileIndexFromLoops(op, rewriter, cbShapeRank);
-    if (failed(cbTileIndex)) {
-      return failure();
-    }
+    ValueRange indices = adaptor.getIndices();
+    Value cbTileIndex = affine::AffineLinearizeIndexOp::create(
+        rewriter, loc, indices, viewTy.getShape());
 
     // Determine DST index from the source op:
     // - Tile compute ops and copy_dst: have dst_idx attribute
@@ -376,10 +374,10 @@ struct TileStoreLowering : OpConversionPattern<TileStoreOp> {
                << defOp->getName();
       }
     } else {
-      dstIndex = *cbTileIndex;
+      dstIndex = cbTileIndex;
     }
 
-    ttk::PackTileOp::create(rewriter, loc, dstIndex, *cb, *cbTileIndex,
+    ttk::PackTileOp::create(rewriter, loc, dstIndex, *cb, cbTileIndex,
                             /*out_of_order=*/true);
 
     rewriter.eraseOp(op);
@@ -880,9 +878,9 @@ lowerTTLOpsToTTKernel(ModuleOp mod, MLIRContext &ctx,
                       StringRef passName) {
   ConversionTarget target(ctx);
   target.addIllegalDialect<tt::ttl::TTLDialect>();
-  target.addLegalDialect<arith::ArithDialect, BuiltinDialect, scf::SCFDialect,
-                         func::FuncDialect, tensor::TensorDialect,
-                         ttkernel::TTKernelDialect>();
+  target.addLegalDialect<affine::AffineDialect, arith::ArithDialect,
+                         BuiltinDialect, scf::SCFDialect, func::FuncDialect,
+                         tensor::TensorDialect, ttkernel::TTKernelDialect>();
 
   // Structural ops remain legal (converted elsewhere or kept as-is).
   target.addLegalOp<ComputeOp, YieldOp, AttachCBOp>();
@@ -948,10 +946,8 @@ static LogicalResult
 lowerTileOpsToTTKernel(ModuleOp mod, MLIRContext &ctx,
                        TTLToTTKernelTypeConverter &typeConverter) {
   ConversionTarget computeTarget(ctx);
-  // TTKernel ops are legal (target dialect)
   computeTarget.addLegalDialect<ttkernel::TTKernelDialect>();
-  // Arith ops are legal (used for index constants)
-  computeTarget.addLegalDialect<arith::ArithDialect>();
+  computeTarget.addLegalDialect<affine::AffineDialect, arith::ArithDialect>();
   // Keep compute ops legal (tile-only lowering here).
   computeTarget.addLegalOp<ComputeOp, YieldOp>();
 

@@ -9,7 +9,11 @@
 #include "ttlang/Dialect/TTL/IR/TTLOps.h"
 #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
 
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Affine/Utils.h"
+#include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Interfaces/ViewLikeInterface.h"
 #include "llvm/ADT/SetVector.h"
 #include <optional>
 
@@ -47,12 +51,9 @@ inline std::optional<mlir::Type> getTileElementType(mlir::Type type) {
 
 /// Return the circular buffer attached to `tensor`, or null if none/ambiguous.
 ///
-/// Recognized producers:
-/// - `ttl.attach_cb`: explicit association between a tensor SSA value and a CB.
-/// - `ttl.cb_wait`: returns a tensor view backed by the CB's pages.
-/// - `unrealized_conversion_cast`: trace through to find the original producer.
-///
-/// Both operations establish a tensor->CB association for compute/DMA purposes.
+/// Traces through ViewLikeOpInterface (cb_reserve, cb_wait),
+/// tensor.extract_slice, tensor.extract, unrealized_conversion_cast,
+/// and attach_cb to find the underlying CB value.
 inline mlir::Value getAttachedCB(mlir::Value tensor) {
   // Trace through unrealized conversion casts (from dialect conversion).
   tensor = traceUnrealizedCasts(tensor);
@@ -71,9 +72,17 @@ inline mlir::Value getAttachedCB(mlir::Value tensor) {
   if (auto attach = tensor.getDefiningOp<mlir::tt::ttl::AttachCBOp>()) {
     return attach.getCb();
   }
-  if (auto wait = tensor.getDefiningOp<mlir::tt::ttl::CBWaitOp>()) {
-    return wait.getCb();
+
+  // Trace through ViewLikeOpInterface: cb_reserve and cb_wait return
+  // the CB directly as their view source.
+  if (auto viewLike = tensor.getDefiningOp<mlir::ViewLikeOpInterface>()) {
+    mlir::Value source = viewLike.getViewSource();
+    if (mlir::isa<CircularBufferType>(source.getType())) {
+      return source;
+    }
+    return getAttachedCB(source);
   }
+
   return mlir::Value();
 }
 
@@ -210,6 +219,62 @@ inline OpTy findPrecedingOp(mlir::Operation *op, StopPredicate stopAtOp) {
     }
   }
   return nullptr;
+}
+
+//===----------------------------------------------------------------------===//
+// Iter index utilities for CB tile indexing
+//===----------------------------------------------------------------------===//
+
+/// Get or create iter_index ops at the start of a compute body. Returns
+/// one Value per iteration domain dimension. Reuses existing iter_index ops
+/// if present (idempotent across multiple callers).
+inline SmallVector<Value> getOrCreateIterIndices(OpBuilder &builder,
+                                                 ComputeOp computeOp) {
+  Block &body = computeOp.getBody().front();
+  unsigned iterRank = computeOp.getIteratorTypesArray().size();
+
+  SmallVector<Value> existing(iterRank, Value());
+  for (Operation &op : body) {
+    if (auto iterIdx = dyn_cast<IterIndexOp>(&op)) {
+      unsigned dim = static_cast<unsigned>(iterIdx.getDim());
+      if (dim < iterRank && !existing[dim]) {
+        existing[dim] = iterIdx.getResult();
+      }
+    }
+  }
+  if (llvm::none_of(existing, [](Value v) { return !v; })) {
+    return existing;
+  }
+
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToStart(&body);
+  Location loc = computeOp.getLoc();
+  for (unsigned d = 0; d < iterRank; ++d) {
+    if (!existing[d]) {
+      existing[d] = IterIndexOp::create(builder, loc, d);
+    }
+  }
+  return existing;
+}
+
+/// Apply an indexing map to iter_index values to produce operand-space
+/// coordinates. For projected permutations this folds to a subset of
+/// iter_index values with no extra ops.
+inline SmallVector<Value>
+applyIndexingMapToIterIndices(OpBuilder &builder, Location loc, AffineMap map,
+                              ValueRange iterIndices) {
+  SmallVector<OpFoldResult> operands(iterIndices.begin(), iterIndices.end());
+  SmallVector<Value> mapped;
+  mapped.reserve(map.getNumResults());
+  for (AffineExpr expr : map.getResults()) {
+    AffineMap singleMap =
+        AffineMap::get(map.getNumDims(), map.getNumSymbols(), expr);
+    OpFoldResult result = affine::makeComposedFoldedAffineApply(
+        builder, loc, singleMap, operands);
+    mapped.push_back(
+        mlir::getValueOrCreateConstantIndexOp(builder, loc, result));
+  }
+  return mapped;
 }
 
 } // namespace mlir::tt::ttl
