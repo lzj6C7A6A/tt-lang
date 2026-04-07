@@ -8,7 +8,7 @@
 #   ./build-docker-images.sh [--check-only] [--no-push] [--no-cache] [--image-type <base|dist|ird>]
 #
 # Arguments:
-#   --check-only      - Only check if images exist, don't build
+#   --check-only      - Only check if images exist in registry, don't build
 #   --no-push         - Build locally but don't push to registry
 #   --no-cache        - Build from scratch without using Docker cache
 #   --image-type TYPE - Build only the specified image type (base, dist, or ird)
@@ -123,18 +123,12 @@ build_image() {
 
     echo "--- Processing: $name ---"
 
-    # Check if image already exists in registry (only when not using --no-push)
-    if [ "$NO_PUSH" = false ]; then
+    # Check if image already exists in registry (--check-only mode)
+    if [ "$CHECK_ONLY" = true ] && [ "$NO_PUSH" = false ]; then
         if docker manifest inspect "$registry_image" > /dev/null 2>&1; then
             echo "Image already exists: $registry_image"
-            if [ "$CHECK_ONLY" = true ]; then
-                return 0
-            fi
-            echo "  Skipping build (image exists)"
             return 0
-        fi
-
-        if [ "$CHECK_ONLY" = true ]; then
+        else
             echo "Image does not exist: $registry_image"
             return 2
         fi
